@@ -35,7 +35,6 @@ Is this question about the retail store database? Answer ONLY "yes" or "no".
         )
         return "yes" in response.choices[0].message.content.strip().lower()
     except:
-        # If LLM fails, assume irrelevant to avoid unsafe SQL
         return False
 
 def clean_sql(sql: str) -> str:
@@ -45,10 +44,28 @@ def clean_sql(sql: str) -> str:
         sql = re.split(r"```(?:sql)?", sql, maxsplit=1)[-1].split("```")[0].strip()
     return sql
 
-def generate_sql(question: str) -> str:
+def generate_sql_with_memory(question: str, chat_history: list) -> str:
+    """
+    Generate SQL using recent conversation history for context.
+    chat_history: list of dicts like [{"role": "user", "content": "..."}, ...]
+    """
+    # Build context from last 3 exchanges
+    context_lines = []
+    for msg in chat_history[-3:]:
+        role = "User" if msg["role"] == "user" else "Assistant"
+        context_lines.append(f"{role}: {msg['content']}")
+    context = "\n".join(context_lines)
+
     prompt = f"""{SCHEMA_CONTEXT}
 
-Question: {question}
+You are given a conversation history and a new question.
+Use the history to resolve pronouns (e.g., "it", "they", "that store") or implied context.
+
+Conversation history:
+{context}
+
+New question: {question}
+
 Generate ONLY a PostgreSQL SELECT query. Do not explain. Do not add markdown.
 SQL:"""
     
@@ -61,7 +78,7 @@ SQL:"""
     raw_sql = response.choices[0].message.content
     return clean_sql(raw_sql)
 
-def generate_answer(question: str, result: list) -> str:
+def generate_answer_with_memory(question: str, result: list, chat_history: list) -> str:
     if not result:
         return "No matching records found in the retail store database."
 
@@ -77,23 +94,32 @@ def generate_answer(question: str, result: list) -> str:
         else:
             return f"The result is {value}."
 
-    # Default: send first 10 rows
-    data_str = json.dumps(result[:10], indent=2)
-    prompt = f"""You are a precise retail data assistant. Answer using ONLY the data below.
+    # For list results, use LLM with memory
+    data_str = json.dumps(result[:5], indent=2)  # limit to 5 for clarity
+    context_lines = []
+    for msg in chat_history[-2:]:
+        role = "User" if msg["role"] == "user" else "Assistant"
+        context_lines.append(f"{role}: {msg['content']}")
+    context = "\n".join(context_lines)
+
+    prompt = f"""You are a helpful retail assistant. Answer based on the data and conversation history.
+
+Conversation history:
+{context}
 
 Question: {question}
-Data (first {min(10, len(result))} of {len(result)} matching rows): {data_str}
+Data (first {min(5, len(result))} of {len(result)} matching rows): {data_str}
 
 Instructions:
-- If more than 10 rows match, mention the total count.
-- Round decimals to 2 places.
-- NEVER say "not available" — data exists.
-- Be concise and professional.
+- Resolve references like "it", "that store", or "them" using the conversation history.
+- Be concise, natural, and professional.
+- Round decimal scores to 2 places.
+- Never say "not available" — the data exists.
 """
     response = client.chat.completions.create(
         model="gpt-4o",
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.0,
+        temperature=0.3,
         max_tokens=500
     )
     return response.choices[0].message.content.strip()
